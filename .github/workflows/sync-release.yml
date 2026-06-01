@@ -1,0 +1,189 @@
+name: Sync Release from zagent
+
+on:
+  repository_dispatch:
+    types: [sync_release]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to sync (e.g. v0.8.0)'
+        required: true
+        type: string
+      source_repo:
+        description: 'Source repository (default: ctz168/zagent)'
+        required: false
+        type: string
+        default: 'ctz168/zagent'
+
+permissions:
+  contents: write
+
+jobs:
+  sync-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine source info
+        id: source
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "tag_name=${{ github.event.client_payload.tag_name }}" >> $GITHUB_OUTPUT
+            echo "source_repo=${{ github.event.client_payload.source_repo }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            echo "source_repo=${{ inputs.source_repo }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch source release info
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          TAG="${{ steps.source.outputs.tag_name }}"
+          REPO="${{ steps.source.outputs.source_repo }}"
+          
+          echo "Syncing release ${TAG} from ${REPO}..."
+          
+          # Get release info
+          RELEASE_JSON=$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>/dev/null)
+          if [ $? -ne 0 ]; then
+            echo "::error::Release ${TAG} not found in ${REPO}"
+            exit 1
+          fi
+          
+          # Extract release details
+          RELEASE_ID=$(echo "$RELEASE_JSON" | jq -r '.id')
+          RELEASE_BODY=$(echo "$RELEASE_JSON" | jq -r '.body // empty')
+          RELEASE_NAME=$(echo "$RELEASE_JSON" | jq -r '.name // "${TAG}"')
+          PRERELEASE=$(echo "$RELEASE_JSON" | jq -r '.prerelease')
+          DRAFT=$(echo "$RELEASE_JSON" | jq -r '.draft')
+          
+          echo "release_id=${RELEASE_ID}" >> $GITHUB_OUTPUT
+          echo "release_name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          echo "prerelease=${PRERELEASE}" >> $GITHUB_OUTPUT
+          echo "draft=${DRAFT}" >> $GITHUB_OUTPUT
+          
+          # Save body to file for multiline handling
+          echo "$RELEASE_BODY" > /tmp/release_body.txt
+          
+          # List assets
+          echo "$RELEASE_JSON" | jq -r '.assets[] | "\(.id) \(.name) \(.size) \(.browser_download_url)"' > /tmp/assets.txt
+          echo "Found $(wc -l < /tmp/assets.txt) assets"
+          cat /tmp/assets.txt
+
+      - name: Download source release assets
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          mkdir -p /tmp/assets
+          cd /tmp/assets
+          
+          REPO="${{ steps.source.outputs.source_repo }}"
+          RELEASE_ID="${{ steps.release.outputs.release_id }}"
+          
+          # Download each asset using GitHub API
+          while IFS=' ' read -r ASSET_ID ASSET_NAME ASSET_SIZE ASSET_URL; do
+            echo "Downloading ${ASSET_NAME}..."
+            gh api "repos/${REPO}/releases/assets/${ASSET_ID}" -H "Accept: application/octet-stream" > "${ASSET_NAME}"
+            echo "  Downloaded: $(wc -c < "${ASSET_NAME}") bytes"
+          done < /tmp/assets.txt
+
+      - name: Create or update tag
+        run: |
+          TAG="${{ steps.source.outputs.tag_name }}"
+          # Create a lightweight tag pointing to the same commit
+          # For zagent_r, we just need the tag for the release
+          git init /tmp/zagent_r_repo
+          cd /tmp/zagent_r_repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create a dummy commit to tag
+          echo "# ZAgent Release ${TAG}" > README.md
+          git add README.md
+          git commit -m "Release ${TAG}"
+          git tag "${TAG}"
+
+      - name: Create release in zagent_r
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          TAG="${{ steps.source.outputs.tag_name }}"
+          REPO="ctz168/zagent_r"
+          SOURCE_REPO="${{ steps.source.outputs.source_repo }}"
+          
+          # Check if release already exists
+          EXISTING=$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>/dev/null || echo "")
+          
+          if [ -n "$EXISTING" ]; then
+            echo "Release ${TAG} already exists in ${REPO}, updating assets..."
+            RELEASE_ID=$(echo "$EXISTING" | jq -r '.id')
+          else
+            echo "Creating new release ${TAG} in ${REPO}..."
+            
+            # Build release body with source reference
+            ORIGINAL_BODY=$(cat /tmp/release_body.txt 2>/dev/null || echo "")
+            RELEASE_BODY="> Synced from [${SOURCE_REPO}](https://github.com/${SOURCE_REPO}) release [${TAG}](https://github.com/${SOURCE_REPO}/releases/tag/${TAG})"
+            if [ -n "$ORIGINAL_BODY" ]; then
+              RELEASE_BODY="${RELEASE_BODY}\n\n---\n\n${ORIGINAL_BODY}"
+            fi
+            
+            PRERELEASE_FLAG=""
+            if [ "${{ steps.release.outputs.prerelease }}" = "true" ]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+            
+            DRAFT_FLAG=""
+            if [ "${{ steps.release.outputs.draft }}" = "true" ]; then
+              DRAFT_FLAG="--draft"
+            fi
+            
+            # Create release
+            RESULT=$(gh release create "${TAG}"               --repo "${REPO}"               --title "${{ steps.release.outputs.release_name }}"               --notes "${RELEASE_BODY}"               ${PRERELEASE_FLAG} ${DRAFT_FLAG})
+            echo "$RESULT"
+            
+            RELEASE_ID=$(gh api "repos/${REPO}/releases/tags/${TAG}" | jq -r '.id')
+          fi
+          
+          echo "release_id=${RELEASE_ID}" >> $GITHUB_ENV
+
+      - name: Upload assets to zagent_r release
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          TAG="${{ steps.source.outputs.tag_name }}"
+          REPO="ctz168/zagent_r"
+          
+          # Get existing assets to avoid duplicates
+          EXISTING_ASSETS=$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>/dev/null | jq -r '.assets[].name' || echo "")
+          
+          cd /tmp/assets
+          for FILE in *; do
+            if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+              continue
+            fi
+            
+            # Skip if already uploaded
+            if echo "$EXISTING_ASSETS" | grep -q "^${FILE}$"; then
+              echo "Asset ${FILE} already exists, skipping..."
+              continue
+            fi
+            
+            echo "Uploading ${FILE}..."
+            gh release upload "${TAG}" "${FILE}"               --repo "${REPO}"               --clobber
+            echo "  Uploaded successfully"
+          done
+
+      - name: Summary
+        run: |
+          echo "## Release Sync Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ steps.source.outputs.tag_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Source:** [${{ steps.source.outputs.source_repo }}](https://github.com/${{ steps.source.outputs.source_repo }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** [ctz168/zagent_r](https://github.com/ctz168/zagent_r)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Assets" >> $GITHUB_STEP_SUMMARY
+          cd /tmp/assets
+          for FILE in *; do
+            SIZE=$(du -h "$FILE" | cut -f1)
+            echo "- \`${FILE}\` (${SIZE})" >> $GITHUB_STEP_SUMMARY
+          done
