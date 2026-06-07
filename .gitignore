@@ -1,0 +1,11 @@
+# Binary and release files
+zagent-linux-amd64
+zagent-linux-amd64.tar.gz
+*.tar.gz
+
+# Runtime logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
