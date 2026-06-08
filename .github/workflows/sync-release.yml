@@ -38,6 +38,46 @@ jobs:
             echo "source_repo=${{ inputs.source_repo }}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Wait for all assets to be available
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          TAG="${{ steps.source.outputs.tag_name }}"
+          REPO="${{ steps.source.outputs.source_repo }}"
+          
+          echo "Waiting for all assets to be uploaded to ${REPO} release ${TAG}..."
+          
+          # Wait up to 15 minutes for all assets (including APK from android job)
+          MAX_WAIT=15
+          WAITED=0
+          EXPECTED_MIN_ASSETS=7  # At minimum: 6 platform archives + checksums
+          
+          while [ $WAITED -lt $MAX_WAIT ]; do
+            ASSET_COUNT=$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.assets | length' 2>/dev/null || echo "0")
+            echo "  Current assets: ${ASSET_COUNT} (waited ${WAITED} min)"
+            
+            if [ "$ASSET_COUNT" -ge "$EXPECTED_MIN_ASSETS" ]; then
+              # Check if APK is present (android job may still be running)
+              HAS_APK=$(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.assets[].name' 2>/dev/null | grep -c "android\|apk" || echo "0")
+              if [ "$HAS_APK" -ge 1 ]; then
+                echo "All assets including APK are available!"
+                break
+              fi
+              # If no APK after 5 minutes, proceed anyway (desktop-only release)
+              if [ $WAITED -ge 5 ]; then
+                echo "No APK found after 5 minutes, proceeding with desktop assets only."
+                break
+              fi
+            fi
+            
+            sleep 60
+            WAITED=$((WAITED + 1))
+          done
+          
+          if [ $WAITED -ge $MAX_WAIT ]; then
+            echo "::warning::Timed out waiting for assets. Proceeding with whatever is available."
+          fi
+
       - name: Fetch source release info
         id: release
         env:
@@ -81,7 +121,8 @@ jobs:
           
           echo "Assets downloaded: $(ls -1 /tmp/assets | wc -l) files"
 
-      - name: Create tag and release in zagent_r
+      - name: Create or update tag and release in zagent_r
+        id: create_release
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
@@ -92,10 +133,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Create an empty commit and tag it (so the tag exists in the repo)
-          git commit --allow-empty -m "Release ${TAG}"
-          git tag "${TAG}"
-          git push origin "${TAG}"
+          # Check if tag already exists locally
+          TAG_EXISTS=$(git tag -l "${TAG}")
+          
+          if [ -z "$TAG_EXISTS" ]; then
+            # Tag doesn't exist - create it
+            git commit --allow-empty -m "Release ${TAG}"
+            git tag "${TAG}"
+            git push origin "${TAG}"
+            echo "Tag ${TAG} created."
+          else
+            echo "Tag ${TAG} already exists, skipping tag creation."
+          fi
           
           # Build release body
           ORIGINAL_BODY=$(cat /tmp/release_body.txt 2>/dev/null || echo "")
@@ -109,10 +158,24 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
           
-          # Create release using gh CLI
-          gh release create "${TAG}"             --repo "ctz168/zagent_r"             --title "${{ steps.release.outputs.release_name }}"             --notes "${RELEASE_BODY}"             ${PRERELEASE_FLAG}
+          # Check if release already exists
+          EXISTING_RELEASE=$(gh release view "${TAG}" --repo "ctz168/zagent_r" --json tagName 2>/dev/null || echo "")
           
-          echo "Release created successfully"
+          if [ -z "$EXISTING_RELEASE" ]; then
+            # Create new release
+            gh release create "${TAG}" \
+              --repo "ctz168/zagent_r" \
+              --title "${{ steps.release.outputs.release_name }}" \
+              --notes "${RELEASE_BODY}" \
+              ${PRERELEASE_FLAG}
+            echo "Release created successfully."
+          else
+            # Update existing release body
+            gh release edit "${TAG}" \
+              --repo "ctz168/zagent_r" \
+              --notes "${RELEASE_BODY}"
+            echo "Release already exists, updated release notes."
+          fi
 
       - name: Upload assets
         env:
@@ -121,14 +184,16 @@ jobs:
           TAG="${{ steps.source.outputs.tag_name }}"
           cd /tmp/assets
           
-          # Upload all assets
+          # Upload all assets (--clobber to overwrite existing)
           ls -la
           for FILE in *; do
             if [ ! -f "$FILE" ]; then
               continue
             fi
             echo "Uploading ${FILE}..."
-            gh release upload "${TAG}" "${FILE}"               --repo "ctz168/zagent_r"               --clobber
+            gh release upload "${TAG}" "${FILE}" \
+              --repo "ctz168/zagent_r" \
+              --clobber
             echo "  Uploaded ${FILE}"
           done
 
